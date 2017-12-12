@@ -5,7 +5,7 @@ library(XLConnect)
 
 # rm(list = ls())
 
-year <- 2015
+year <- 2016
 
 prof_bg <- read_csv(paste(year, "neighborhood extended (BG).csv"))
 prof_tract <- read_csv(paste(year, "neighborhood extended (tract).csv"))
@@ -65,7 +65,7 @@ prof_df <- inner_join(prof_bg, prof_tract, by = "name") %>%
 
 
 # write to Excel template
-excel <- loadWorkbook(paste0("New Haven final ", year, ".xlsx"))
+excel <- loadWorkbook("excel_template.xlsx")
 setStyleAction(excel, XLC$STYLE_ACTION.NONE)
 writeNamedRegion(excel, prof_df %>% select(-indicator), name = "profile_data", header = F)
 saveWorkbook(excel)
