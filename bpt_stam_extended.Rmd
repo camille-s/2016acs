@@ -1,0 +1,582 @@
+---
+title: "Bridgeport + Stamford extended"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+```
+
+```{r}
+################# VARIABLES #######
+year <- 2016
+stam <- read_csv("stamford_tract_shares.csv")
+bpt <- read_csv("bpt_tract_shares.csv") %>% rename(share = reshare)
+geo <- bind_rows(stam %>% mutate(city = "Stamford"), bpt %>% mutate(city = "Bridgeport")) %>%
+	mutate(name = str_replace_all(name, "_", " ") %>% str_to_title())
+# clean up neighborhood names later
+tracts <- geo$trct
+city_names <- c("Bridgeport", "Stamford")
+county <- "09001"
+#####################################
+
+acs_vars <- read_csv("../reference/acs_variables.csv")
+```
+
+```{r}
+make_share <- function(df, denom) {
+	df %>%
+		mutate(share = ifelse(group == denom, NA, round(value / value[group == denom], digits = 3)))
+}
+
+add_grp <- function(df, ...) {
+	cols <- quos(...)
+	select(df, !!!cols) %>% reduce(add)
+}
+```
+
+```{r}
+table_nums <- list(
+  total_pop = "B01003",
+  sex_age = "B01001",
+  race = "B03002",
+  family = "B11001",
+  children = "B11003",
+  vacancy = "B25004",
+  tenure = "B25003",
+  disconnect = "B14005",
+  education = "B15002",
+  immigration = "B05005",
+  language2 = "B16004",
+  labor = "B23025",
+  commute = "B08301",
+  parent_work = "B23008",
+  occupation = "C24010",
+  hh_income = "B19001",
+  agg_income = "B19025",
+  fam_income = "B19101",
+  poverty = "C17002",
+  pov_age = "B17024",
+  fam_poverty = "B17010",
+  vehicle = "B25044",
+  crowding = "B25014",
+  housing_val = "B25075",
+  mortgage = "B25091",
+  rent = "B25074"
+)
+```
+
+```{r}
+fetch_tract <- table_nums %>%
+	map(function(num) {
+		get_acs(geography = "tract", table = num, year = year, state = "09", county = "01") %>%
+			filter(GEOID %in% tracts) %>%
+			inner_join(acs_vars, by = c("variable" = "name")) %>%
+			inner_join(geo, by = c("GEOID" = "trct")) %>%
+			mutate(level = "neighborhood")
+	})
+fetch_city <- table_nums %>%
+	map(function(num) {
+		get_acs(geography = "county subdivision", table = num, year = year, state = "09", county = "01") %>%
+			mutate(name = str_extract(NAME, "^[\\w\\s]+(?= town,)")) %>%
+			mutate(name2 = name) %>%
+			filter(name %in% city_names) %>%
+			inner_join(acs_vars, by = c("variable" = "name")) %>%
+			mutate(level = "city")
+	})
+fetch_county <- table_nums %>%
+	map(function(num) {
+		get_acs(geography = "county", table = num, year = year, state = "09") %>%
+			filter(GEOID %in% county) %>%
+			inner_join(acs_vars, by = c("variable" = "name")) %>%
+			mutate(name = str_extract(NAME, "^[\\w\\s]+(?=,)")) %>%
+			mutate(name2 = name) %>%
+			mutate(level = "county")
+	})
+fetch_state <- table_nums %>%
+	map(function(num) {
+		get_acs(geography = "state", table = num, year = year) %>%
+			filter(GEOID == "09") %>%
+			inner_join(acs_vars, by = c("variable" = "name")) %>%
+			mutate(name = NAME) %>%
+			mutate(name2 = name) %>%
+			mutate(level = "state")
+	})
+fetch <- pmap(list(fetch_tract, fetch_city, fetch_county, fetch_state), bind_rows) %>%
+	map(~replace_na(., list(share = 1.0)) %>% 
+				mutate(wtd = estimate * share) %>%
+				mutate(level = as.factor(level) %>% fct_relevel("neighborhood", "city", "county", "state")) %>%
+				select(level, city, name, share, variable, label, wtd) %>%
+				mutate(label = str_remove(label, "Total!!")) %>%
+				mutate(label = factor(label, unique(label))) %>%
+				group_by(level, city, name, label) %>%
+				summarise(value = sum(wtd) %>% round()) %>%
+				spread(key = label, value = value) %>%
+				ungroup()
+			)
+
+table <- table_nums %>% map(~c())
+```
+
+
+
+
+Total population
+
+```{r}
+table$total_pop <- fetch$total_pop %>%
+	rename(total_pop = Total) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	mutate(share = NA %>% as.numeric())
+
+table$total_pop
+```
+
+Sex by age: 0-5, 5-17, 18-24, 25-34, 35-44, 45-54, 55-64, 65+
+
+```{r}
+table$sex_age <- fetch$sex_age %>%
+	mutate(
+		under5 = add_grp(., 6, 30),
+		age5_17 = add_grp(., 7:9, 31:33),
+		age18_24 = add_grp(., 10:13, 34:37),
+		age25_34 = add_grp(., 14:15, 38:39),
+		age35_44 = add_grp(., 16:17, 40:41),
+		age45_54 = add_grp(., 18:19, 42:43),
+		age55_64 = add_grp(., 20:22, 44:46),
+		age65plus = add_grp(., 23:28, 47:52)
+	) %>%
+	select(level:name, total_pop = Total, male = Male, female = Female, under5:age65plus) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("total_pop") %>%
+	filter(group != "total_pop")
+
+table$sex_age
+```
+
+
+Race: hispanic, non-hispanic white, black, asian, other
+
+```{r}
+# set name to total_pop_race to deal with duplicates
+table$race <- fetch$race %>%
+	mutate(other_race = add_grp(., 8, 10:12)) %>% 
+	select(level:name, total_pop_race = Total, hispanic = 15, white = 6, black = 7, asian = 9, other_race) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("total_pop_race")
+
+table$race
+```
+
+
+Family structure: total households; family households: married couple, single male, single female
+
+```{r}
+family <- fetch$family %>%
+	select(level:name, total_hh = Total, family_hh = 5, married_hh = 6, male_hh = 8, female_hh = 9) %>%
+	gather(key = group, value = value, -level:-name)
+
+table$family <- bind_rows(
+	family %>% filter(group %in% c("total_hh", "family_hh")) %>% make_share("total_hh"),
+	family %>% filter(group != "total_hh") %>% make_share("family_hh") %>% mutate(group = factor(group) %>% fct_recode(family_hh_type = "family_hh"))
+)
+
+table$family
+```
+
+
+Children in families: married family with kid, male hh with kid, female hh with kid, as percentage of family households
+
+```{r}
+table$children <- fetch$children %>%
+	select(level:name, family_hh = 4, married_hh_kids = 6, male_hh_kids = 13, female_hh_kids = 23) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("family_hh") %>%
+	filter(group != "family_hh")
+
+table$children
+```
+
+
+Vacancy & tenure: total housing units, vacant, occupied; owned & rented as percentage of occupied units
+
+```{r}
+vac_ten <- fetch$vacancy %>%
+	select(level:name, vacant = Total) %>%
+	inner_join(fetch$tenure, by = c("level", "city", "name")) %>%
+	select(level:name, vacant, occupied = Total, owned = 6, rented = 7) %>%
+	mutate(total_units = vacant + occupied) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	mutate(group = as.factor(group) %>% fct_relevel("total_units", "vacant")) %>%
+	arrange(group)
+
+table$vacancy <- vac_ten %>% 
+	filter(group %in% c("total_units", "vacant", "occupied")) %>% 
+	make_share("total_units")
+table$tenure <- vac_ten %>% 
+	filter(group %in% c("occupied", "owned", "rented")) %>% 
+	make_share("occupied") %>%
+	filter(group != "occupied")
+
+table$vacancy
+table$tenure
+```
+
+
+disconnected youth: pop ages 16-19, share not working & not enrolled
+
+```{r}
+table$disconnect <- fetch$disconnect %>%
+	mutate(disconnected = add_grp(., 13:14, 17:18, 27:28, 31:32)) %>%
+	select(level:name, ages16_19 = Total, disconnected) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("ages16_19")
+
+table$disconnect
+```
+
+
+```{r}
+table$education <- fetch$education %>%
+	mutate(less_than_hs = add_grp(., 5:12),
+				 hs_plus = add_grp(., 13:20),
+				 bach_plus = add_grp(., 17:20)
+				 ) %>%
+	select(level:name, age25plus = Total, less_than_hs:bach_plus) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("age25plus")
+
+table$education
+```
+
+language + english speakers: pop age 5+; speak only english, non-english home language; non-english + speak less than very well; spanish + less than very well
+
+```{r}
+table$language2 <- fetch$language2 %>% 
+	mutate(
+		english_only = add_grp(., 6, 28, 50),
+		other_home_lang = add_grp(., 7, 12, 17, 22, 29, 34, 39, 44, 51, 56, 61, 66),
+		low_english = add_grp(., 9:11, 14:16, 19:21, 24:26, 31:33, 36:38, 41:43, 46:48, 53:55, 58:60, 63:65, 68:70),
+		spanish = add_grp(., 7, 29, 51),
+		spanish_low_eng = add_grp(., 9:11, 31:33, 53:55)
+		) %>%
+	select(level:name, age5plus = Total, english_only:spanish_low_eng) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("age5plus")
+
+table$language2
+```
+
+employment: pop age 16+, labor force, civilian labor force, employed, unemployed, not in labor force. unemployment rate out of civ labor force
+
+```{r}
+labor <- fetch$labor %>%
+	select(level:name, age16plus = Total, labor_force = 5, civ_labor_force = 6, civ_employed = 7, civ_unemployed = 8, not_in_force = 10) %>%
+	gather(key = group, value = value, -level:-name)
+
+table$labor <- bind_rows(
+	labor %>% make_share("age16plus"),
+	labor %>% 
+		filter(group %in% c("civ_labor_force", "civ_unemployed")) %>% 
+		make_share("civ_labor_force") %>% 
+		mutate(group = as.factor(group) %>% fct_recode(unemployment = "civ_unemployed")) %>%
+		filter(group != "civ_labor_force")
+)
+
+table$labor
+```
+
+commuting: workers age 16+, work at home, don't work at home, car alone, carpool, public transit, walk + bike, cab/motorcycle/other
+
+```{r}
+table$commute <- fetch$commute %>%
+	mutate(
+		work_not_home = add_grp(., 5, 13, 19:23),
+		walk_bike = add_grp(., 21:22),
+		other_transit = add_grp(., 19, 20, 23)
+	) %>% 
+	select(level:name, workers = Total, work_home = 24, work_not_home, drive_alone = 6, carpool = 7, public_transit = 13, walk_bike, other_transit) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("workers")
+
+table$commute
+```
+
+working parents: number of kids in families; kids in 2-parent family both working + kids in 1-parent family with parent working
+
+```{r}
+table$parent_work <- fetch$parent_work %>%
+	mutate(kids_all_parents_work = add_grp(., 7, 13, 16, 20, 26, 29)) %>%
+	select(level:name, kids_in_fams = Total, kids_all_parents_work) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("kids_in_fams")
+
+table$parent_work
+```
+
+occupation: employed; management, professional, related; service; sales + office; natural resources, construction, maintenance; production, transport, material moving
+
+```{r}
+table$occupation <- fetch$occupation %>%
+	mutate(
+		management = add_grp(., 6, 42),
+		service = add_grp(., 22, 58),
+		sales = add_grp(., 30, 66),
+		resources = add_grp(., 33, 69),
+		production = add_grp(., 37, 73)
+	) %>%
+	select(level:name, employed = Total, management:production) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("employed") %>%
+	mutate(group = factor(group) %>% fct_recode(employed_occ = "employed"))
+
+table$occupation
+```
+
+household income: total households; < 10k; 10k-14.9; 15k-24.9; < 25k; 25k-49.9; < 50k; 50k-74.9; 75k-99.9; > 100k; 100k-149.9; 150k-199.9; > 200k
+
+```{r}
+table$hh_income <- fetch$hh_income %>%
+	mutate(
+		hh_inc15_25 = add_grp(., 7:8),
+		hh_inc_under25 = add_grp(., 5:8),
+		hh_inc25_50 = add_grp(., 9:13),
+		hh_inc_under50 = add_grp(., 5:13),
+		hh_inc50_75 = add_grp(., 14:15),
+		hh_inc_100plus = add_grp(., 17:20),
+		hh_inc100_150 = add_grp(., 17:18)
+	) %>%
+	select(level:name, households = Total, hh_inc_under10 = 5, hh_inc10_15 = 6, hh_inc15_25, hh_inc_under25, hh_inc25_50, hh_inc_under50, hh_inc50_75, hh_inc75_100 = 16, hh_inc_100plus, hh_inc100_150, hh_inc150_200 = 19, hh_inc_200plus = 20) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("households") %>%
+	mutate(group = factor(group) %>% fct_recode(households_inc = "households"))
+
+table$hh_income
+```
+
+average household income: divide agg income by number of households
+
+```{r}
+table$agg_income <- fetch$agg_income %>%
+	inner_join(fetch$hh_income %>% select(level:name, Total), by = c("level", "city", "name")) %>%
+	select(level:name, agg = 4, households = 5) %>%
+	mutate(avg_hh_inc = round(agg / households)) %>%
+	select(-agg:-households) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	mutate(share = NA %>% as.numeric())
+
+table$agg_income
+```
+
+family income: same groups as household
+
+```{r}
+table$fam_income <- fetch$fam_income %>%
+	mutate(
+		fam_inc15_25 = add_grp(., 7:8),
+		fam_inc_under25 = add_grp(., 5:8),
+		fam_inc25_50 = add_grp(., 9:13),
+		fam_inc_under50 = add_grp(., 5:13),
+		fam_inc50_75 = add_grp(., 14:15),
+		fam_inc_100plus = add_grp(., 17:20),
+		fam_inc100_150 = add_grp(., 17:18)
+	) %>%
+	select(level:name, families = Total, fam_inc_under10 = 5, fam_inc10_15 = 6, fam_inc15_25, fam_inc_under25, fam_inc25_50, fam_inc_under50, fam_inc50_75, fam_inc75_100 = 16, fam_inc_100plus, fam_inc100_150, fam_inc150_200 = 19, fam_inc_200plus = 20) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("families") %>%
+	mutate(group = factor(group) %>% fct_recode(families_inc = "families"))
+
+table$fam_income
+```
+
+ratio to poverty level: number with status; number at 1xfpl, 2x, > 2x
+
+```{r}
+table$poverty <- fetch$poverty %>%
+	mutate(
+		poverty = add_grp(., 5:6),
+		low_inc = add_grp(., 5:10)
+	) %>%
+	select(level:name, pov_determined = Total, poverty, low_inc, twice_fpl = 11) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("pov_determined")
+
+table$poverty
+```
+
+families in poverty: poverty determined, number under fpl
+
+```{r}
+table$fam_poverty <- fetch$fam_poverty %>%
+	select(level:name, families = 4, family_poverty = 5) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("families") %>%
+	mutate(group = factor(group) %>% fct_recode(families_pov = "families"))
+
+table$fam_poverty
+```
+
+vehicles: occupied housing units, 0, 1, 2+ vehicles
+
+```{r}
+table$vehicle <- fetch$vehicle %>%
+	mutate(
+		hh_0_vehicle = add_grp(., 6, 13),
+		hh_1_vehicle = add_grp(., 7, 14),
+		hh_2plus_vehicle = add_grp(., 8:11, 15:18)
+	) %>%
+	select(level:name, occupied_units = Total, hh_0_vehicle:hh_2plus_vehicle) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("occupied_units")
+
+table$vehicle
+```
+
+overcrowding: 1 or less occupants; 1.01 or more
+
+```{r}
+table$crowding <- fetch$crowding %>%
+	mutate(
+		not_crowded = add_grp(., 6:7, 12:13),
+		overcrowded = add_grp(., 8:10, 14:16)
+	) %>%
+	select(level:name, households = Total, not_crowded, overcrowded) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("households") %>%
+	filter(group != "households")
+
+table$crowding
+```
+
+housing value:  owner-occupied units; house values < 50k; 50k-99.9; 100k-149.9; 150k-199.9; > 200k; 200k-249.9; 250k-299.9; > 300k
+
+```{r}
+table$housing_val <- fetch$housing_val %>%
+	mutate(
+		val_under50 = add_grp(., 5:12),
+		val50_100 = add_grp(., 13:17),
+		val100_150 = add_grp(., 18:19),
+		val150_200 = add_grp(., 20:21),
+		val_200plus = add_grp(., 22:30),
+		val_300plus = add_grp(., 24:30)
+	) %>%
+	select(level:name, owned_units = Total, val_under50, val50_100, val100_150, val150_200, val_200plus, val200_250 = 22, val250_300 = 23, val_300plus) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("owned_units") %>%
+	mutate(group = factor(group) %>% fct_recode(owned_units_val = "owned_units"))
+
+table$housing_val
+```
+
+housing cost burden, mortgage + rent; owned units, owned burden, owned severe burden; rented units, rented burden, rented severe burden; both
+
+```{r}
+mortgage <- fetch$mortgage %>%
+	mutate(
+		owned_cost30 = add_grp(., 11:14, 22:25),
+		owned_cost50 = add_grp(., 14, 25)
+	) %>%
+	select(level:name, owned_units = Total, owned_cost30, owned_cost50)
+
+rent <- fetch$rent %>%
+	mutate(
+		rent_cost30 = add_grp(., 9:12, 18:21, 27:30, 36:39, 45:48, 54:57, 63:66),
+		rent_cost50 = add_grp(., 12, 21, 30, 39, 48, 57, 66)
+	) %>%
+	select(level:name, rented_units = Total, rent_cost30, rent_cost50)
+
+cost <- inner_join(mortgage, rent, by = c("level", "city", "name")) %>%
+	mutate(units = owned_units + rented_units) %>%
+	mutate(units_cost30 = owned_cost30 + rent_cost30, units_cost50 = owned_cost50 + rent_cost50) %>%
+	gather(key = group, value = value, -level:-name)
+
+table$cost <- bind_rows(
+	cost %>% filter(str_detect(group, "^owned")) %>% make_share("owned_units"),
+	cost %>% filter(str_detect(group, "^rent"))  %>% make_share("rented_units"),
+	cost %>% filter(str_detect(group, "^units")) %>% make_share("units")
+) %>%
+	mutate(group = factor(group) %>% fct_recode(owned_units_burden = "owned_units", rented_units_burden = "rented_units", units_burden = "units"))
+table$mortgage <- NULL
+table$rent <- NULL
+
+table$cost
+```
+
+immigrants: total pop, total foreign born; entered 2010 or later, naturalized, not citizen
+
+```{r}
+table$immigration <- fetch$immigration %>%
+	mutate(
+		foreign_born = add_grp(., 7, 12, 17, 22),
+		naturalized = add_grp(., 8, 13, 18, 23),
+		not_citizen = add_grp(., 9, 14, 19, 24)
+	) %>%
+	select(level:name, total_pop_fb = Total, foreign_born, entered_2010later = 5, naturalized, not_citizen) %>%
+	gather(key = group, value = value, -level:-name) %>%
+	make_share("total_pop_fb")
+
+table$immigration
+```
+
+poverty by age: poverty determined, under fpl: under 6yrs, under 18yrs, 65+
+
+```{r}
+pov_age <- fetch$pov_age %>%
+	mutate(
+		under6_status = add_grp(., 5),
+		under6_poverty = add_grp(., 6:8),
+		under18_status = add_grp(., 5, 18, 31),
+		under18_poverty = add_grp(., 6:8, 19:21, 32:34),
+		over65_status = add_grp(., 109, 122),
+		over65_poverty = add_grp(., 110:112, 123:125)
+	) %>%
+	select(level:name, under6_status:over65_poverty) %>%
+	gather(key = group, value = value, -level:-name)
+
+table$pov_age <- bind_rows(
+	pov_age %>% filter(str_detect(group, "^under6")) %>% make_share("under6_status"),
+	pov_age %>% filter(str_detect(group, "^under18")) %>% make_share("under18_status"),
+	pov_age %>% filter(str_detect(group, "^over65")) %>% make_share("over65_status")
+)
+
+table$pov_age
+```
+
+bind together
+
+```{r}
+rearrange_cols <- function(.data, omit = 1) {
+	x <- c(1:ncol(.data))[-omit]
+  half <- length(x) / 2
+  vals <- x[1:half]
+  shares <- x[(half + 1):length(x)]
+  # transpose: works like zip in python, returns vector of positions with est & moe interwoven
+  # names(.data)[shares] <- names(.data)[vals]
+  arranged <- list(vals, shares) %>% transpose() %>% unlist()
+  return(.data %>% select(omit, arranged))
+}
+```
+
+
+```{r}
+bound <- table %>% bind_rows() %>% mutate(group = factor(group, unique(group)))
+
+df <- inner_join(
+	bound %>% select(-share) %>% spread(key = group, value = value),
+	bound %>% select(-value) %>% spread(key = group, value = share),
+	by = c("level", "city", "name"), suffix = c("_num", "_per")
+) %>% 
+	rearrange_cols(omit = 1:3)
+
+write_csv(df, sprintf("%s BPT Stamford extended.csv", year))
+```
+
